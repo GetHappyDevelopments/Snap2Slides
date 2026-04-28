@@ -191,6 +191,27 @@ def _overlap_ratio(first: Rect, second: Rect) -> float:
     return _intersection_area(first, second) / smaller
 
 
+def _build_text_mask(width: int, height: int, text_rects: list[Rect], padding: int = 2) -> np.ndarray:
+    mask = np.zeros((height, width), dtype=np.uint8)
+    for rect in text_rects:
+        r = rect.padded(padding, width, height)
+        mask[r.y : r.y2, r.x : r.x2] = 255
+    return mask
+
+
+def _remove_text_from_image(image: Image.Image, text_rects: list[Rect]) -> Image.Image:
+    if not text_rects:
+        return image
+
+    arr = np.array(image.convert("RGB"))
+    mask = _build_text_mask(image.width, image.height, text_rects, padding=2)
+    if not np.any(mask):
+        return image
+
+    inpainted = cv2.inpaint(arr, mask, 3, cv2.INPAINT_TELEA)
+    return Image.fromarray(inpainted)
+
+
 def _detect_visuals(slide_image: Image.Image, text_rects: list[Rect]) -> list[VisualBlock]:
     arr = np.array(slide_image.convert("RGB"))
     h, w = arr.shape[:2]
@@ -198,10 +219,8 @@ def _detect_visuals(slide_image: Image.Image, text_rects: list[Rect]) -> list[Vi
     hsv = cv2.cvtColor(arr, cv2.COLOR_RGB2HSV)
     saturation = hsv[:, :, 1]
 
-    text_mask = np.zeros((h, w), dtype=np.uint8)
-    for rect in text_rects:
-        r = rect.padded(5, w, h)
-        text_mask[r.y : r.y2, r.x : r.x2] = 255
+    text_mask = _build_text_mask(w, h, text_rects, padding=5)
+    visual_source = _remove_text_from_image(slide_image, text_rects)
 
     # Keep non-white or colorful content, but remove OCR text so photos, logos, icons and colored panels remain.
     not_white = ((gray < 248) | (saturation > 28)).astype(np.uint8) * 255
@@ -220,7 +239,7 @@ def _detect_visuals(slide_image: Image.Image, text_rects: list[Rect]) -> list[Vi
         if area < min_area or bw < 18 or bh < 18:
             continue
         rect = Rect(int(x), int(y), int(bw), int(bh)).padded(3, w, h)
-        crop = slide_image.crop((rect.x, rect.y, rect.x2, rect.y2))
+        crop = visual_source.crop((rect.x, rect.y, rect.x2, rect.y2))
         visuals.append(VisualBlock(rect=rect, image=crop))
 
     return _dedupe_visuals(visuals, w, h)
