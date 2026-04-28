@@ -5,7 +5,7 @@ Kleine Dialoganwendung, die ein Screenshot-/Rasterbild mit PowerPoint-Folien in 
 ## Start
 
 ```powershell
-python app.py
+python launcher.py
 ```
 
 Oder unter Windows per Doppelklick auf `start.bat`.
@@ -29,8 +29,11 @@ Die Rekonstruktion ist OCR-basiert. Je sauberer und hoeher aufgeloest die Vorlag
 ## Bedienung
 
 - Bild auswaehlen, Zielpfad pruefen und `PPTX erzeugen` starten
+- beim Start zeigt Snap2Slides mindestens 3 Sekunden lang den Splash-Screen
+- falls Abhaengigkeiten fehlen, installiert der Launcher sie waehrend der Splash-Screen sichtbar bleibt
 - waehrend der Umwandlung zeigt die Statusleiste den aktuellen Schritt
 - nach erfolgreichem Export kann die erzeugte PowerPoint direkt ueber `Oeffnen` gestartet werden
 - Tastaturkuerzel: `Strg+O` fuer Bildauswahl, `Strg+S` fuer Zielpfad, `Enter` zum Starten
 
 Das Programm nutzt `assets/app_icon.ico` als Windows-/Taskbar-Icon.
+Der Splash-Screen liegt unter `assets/splash.png`.

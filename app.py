@@ -30,6 +30,7 @@ TEXT_BLACK = RGBColor(20, 20, 20)
 APP_ROOT = Path(__file__).resolve().parent
 APP_ICON_ICO = APP_ROOT / "assets" / "app_icon.ico"
 APP_ICON_PNG = APP_ROOT / "assets" / "app_icon.png"
+APP_SPLASH_PNG = APP_ROOT / "assets" / "splash.png"
 WINDOWS_APP_ID = "Snap2Slides.Image2PptSlicer"
 
 
@@ -351,6 +352,40 @@ def configure_windows_taskbar_icon() -> None:
         pass
 
 
+def show_startup_splash(root: tk.Tk, minimum_ms: int = 3000) -> None:
+    if os.environ.get("SNAP2SLIDES_SKIP_SPLASH") == "1" or not APP_SPLASH_PNG.exists():
+        return
+
+    root.withdraw()
+    splash = tk.Toplevel(root)
+    splash.overrideredirect(True)
+    splash.configure(background="#020b1c")
+
+    screen_w = splash.winfo_screenwidth()
+    screen_h = splash.winfo_screenheight()
+    max_w = min(980, int(screen_w * 0.82))
+    max_h = min(560, int(screen_h * 0.72))
+
+    image = Image.open(APP_SPLASH_PNG).convert("RGB")
+    image.thumbnail((max_w, max_h), Image.Resampling.LANCZOS)
+    splash._photo = ImageTk.PhotoImage(image)  # type: ignore[attr-defined]
+    label = ttk.Label(splash, image=splash._photo, borderwidth=0)  # type: ignore[attr-defined]
+    label.pack()
+
+    splash.update_idletasks()
+    x = (screen_w - splash.winfo_width()) // 2
+    y = (screen_h - splash.winfo_height()) // 2
+    splash.geometry(f"+{x}+{y}")
+    splash.lift()
+
+    def finish_splash() -> None:
+        splash.destroy()
+        root.deiconify()
+        root.lift()
+
+    root.after(minimum_ms, finish_splash)
+
+
 class Image2PptApp(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
@@ -607,6 +642,7 @@ def main() -> None:
 
     configure_windows_taskbar_icon()
     app = Image2PptApp()
+    show_startup_splash(app)
     app.mainloop()
 
 

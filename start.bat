@@ -1,2 +1,2 @@
 @echo off
-python app.py
+python launcher.py
