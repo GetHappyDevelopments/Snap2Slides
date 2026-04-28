@@ -15,8 +15,7 @@ import numpy as np
 from PIL import Image, ImageTk
 from pptx import Presentation
 from pptx.dml.color import RGBColor
-from pptx.enum.shapes import MSO_SHAPE
-from pptx.util import Inches, Pt
+from pptx.util import Pt
 from rapidocr_onnxruntime import RapidOCR
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
@@ -175,6 +174,68 @@ def _guess_text_color(arr: np.ndarray, rect: Rect) -> RGBColor:
     return TEXT_BLACK
 
 
+def _intersection_area(first: Rect, second: Rect) -> int:
+    x1 = max(first.x, second.x)
+    y1 = max(first.y, second.y)
+    x2 = min(first.x2, second.x2)
+    y2 = min(first.y2, second.y2)
+    if x2 <= x1 or y2 <= y1:
+        return 0
+    return (x2 - x1) * (y2 - y1)
+
+
+def _overlap_ratio(first: Rect, second: Rect) -> float:
+    smaller = min(first.area, second.area)
+    if smaller <= 0:
+        return 0.0
+    return _intersection_area(first, second) / smaller
+
+
+def _contains_rect(outer: Rect, inner: Rect, margin: int = 0) -> bool:
+    return (
+        inner.x >= outer.x - margin
+        and inner.y >= outer.y - margin
+        and inner.x2 <= outer.x2 + margin
+        and inner.y2 <= outer.y2 + margin
+    )
+
+
+def _is_background_sized(rect: Rect, max_w: int, max_h: int) -> bool:
+    return rect.area > max_w * max_h * 0.9 or (rect.w > max_w * 0.95 and rect.h > max_h * 0.95)
+
+
+def _find_bordered_visuals(slide_image: Image.Image, text_mask: np.ndarray) -> list[VisualBlock]:
+    arr = np.array(slide_image.convert("RGB"))
+    h, w = arr.shape[:2]
+    gray = cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY)
+    blurred = cv2.GaussianBlur(gray, (3, 3), 0)
+    edges = cv2.Canny(blurred, 45, 130)
+    edges[text_mask > 0] = 0
+
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+    closed = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, kernel, iterations=2)
+    contours, _ = cv2.findContours(closed, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+
+    min_area = max(900, int(w * h * 0.003))
+    candidates: list[VisualBlock] = []
+    for contour in contours:
+        x, y, bw, bh = cv2.boundingRect(contour)
+        rect = Rect(int(x), int(y), int(bw), int(bh)).padded(2, w, h)
+        if rect.area < min_area or rect.w < 24 or rect.h < 24 or _is_background_sized(rect, w, h):
+            continue
+
+        contour_area = cv2.contourArea(contour)
+        fill_ratio = contour_area / max(1, bw * bh)
+        if fill_ratio < 0.45:
+            continue
+
+        crop = slide_image.crop((rect.x, rect.y, rect.x2, rect.y2))
+        candidates.append(VisualBlock(rect=rect, image=crop))
+
+    candidates.sort(key=lambda item: (item.rect.y, item.rect.x, item.rect.area))
+    return _dedupe_visuals(candidates, w, h)
+
+
 def _detect_visuals(slide_image: Image.Image, text_rects: list[Rect]) -> list[VisualBlock]:
     arr = np.array(slide_image.convert("RGB"))
     h, w = arr.shape[:2]
@@ -186,6 +247,8 @@ def _detect_visuals(slide_image: Image.Image, text_rects: list[Rect]) -> list[Vi
     for rect in text_rects:
         r = rect.padded(5, w, h)
         text_mask[r.y : r.y2, r.x : r.x2] = 255
+
+    bordered_visuals = _find_bordered_visuals(slide_image, text_mask)
 
     # Keep non-white or colorful content, but remove OCR text so photos, logos, icons and colored panels remain.
     not_white = ((gray < 248) | (saturation > 28)).astype(np.uint8) * 255
@@ -204,25 +267,46 @@ def _detect_visuals(slide_image: Image.Image, text_rects: list[Rect]) -> list[Vi
         if area < min_area or bw < 18 or bh < 18:
             continue
         rect = Rect(int(x), int(y), int(bw), int(bh)).padded(3, w, h)
+        if _is_background_sized(rect, w, h):
+            continue
         crop = slide_image.crop((rect.x, rect.y, rect.x2, rect.y2))
         visuals.append(VisualBlock(rect=rect, image=crop))
 
-    visuals.sort(key=lambda item: item.rect.area, reverse=True)
-    return _remove_contained_visuals(visuals)
+    return _merge_visuals(bordered_visuals, visuals, w, h)
 
 
-def _remove_contained_visuals(visuals: list[VisualBlock]) -> list[VisualBlock]:
+def _dedupe_visuals(visuals: list[VisualBlock], max_w: int, max_h: int) -> list[VisualBlock]:
     kept: list[VisualBlock] = []
-    for candidate in visuals:
+    for candidate in sorted(visuals, key=lambda item: item.rect.area):
+        if _is_background_sized(candidate.rect, max_w, max_h):
+            continue
+        if any(_overlap_ratio(candidate.rect, existing.rect) > 0.82 for existing in kept):
+            continue
+        kept.append(candidate)
+    return kept
+
+
+def _merge_visuals(
+    bordered_visuals: list[VisualBlock], component_visuals: list[VisualBlock], max_w: int, max_h: int
+) -> list[VisualBlock]:
+    kept = _dedupe_visuals(bordered_visuals, max_w, max_h)
+
+    for candidate in sorted(component_visuals, key=lambda item: item.rect.area, reverse=True):
+        if any(_overlap_ratio(candidate.rect, existing.rect) > 0.7 for existing in kept):
+            continue
+        contained_children = sum(1 for existing in kept if _contains_rect(candidate.rect, existing.rect, margin=4))
+        if contained_children >= 2:
+            continue
+
         contained = False
         for existing in kept:
-            cx1, cy1, cx2, cy2 = candidate.rect.x, candidate.rect.y, candidate.rect.x2, candidate.rect.y2
-            ex1, ey1, ex2, ey2 = existing.rect.x, existing.rect.y, existing.rect.x2, existing.rect.y2
-            if cx1 >= ex1 and cy1 >= ey1 and cx2 <= ex2 and cy2 <= ey2:
+            if _contains_rect(existing.rect, candidate.rect, margin=4):
                 contained = True
                 break
         if not contained:
             kept.append(candidate)
+
+    kept.sort(key=lambda item: (item.rect.y, item.rect.x))
     return kept
 
 
@@ -307,10 +391,6 @@ def export_pptx(slides: list[AnalyzedSlide], output_path: Path, progress: Callab
         for index, analyzed in enumerate(slides, start=1):
             progress(f"Exportiere Folie {index}/{len(slides)} ...")
             slide = prs.slides.add_slide(blank_layout)
-            bg = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, 0, 0, prs.slide_width, prs.slide_height)
-            bg.fill.solid()
-            bg.fill.fore_color.rgb = RGBColor(255, 255, 255)
-            bg.line.fill.background()
 
             scale_x = prs.slide_width / analyzed.image.width
             scale_y = prs.slide_height / analyzed.image.height

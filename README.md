@@ -22,7 +22,8 @@ python -m pip install --user -r requirements.txt
 
 - erkannte Einzel-Folien werden zu separaten PowerPoint-Folien
 - OCR-Texte werden als editierbare Textfelder eingefuegt
-- erkannte visuelle Flaechen wie Fotos, Logos, Icons oder farbige Boxen werden als einzelne Bildobjekte eingefuegt
+- erkannte visuelle Flaechen wie Fotos, Logos, Icons, Diagramme oder farbige Boxen werden als einzelne Bildobjekte eingefuegt
+- abgegrenzte Bildbereiche werden als eigene PowerPoint-Objekte exportiert; es wird kein Screenshot als Folien-Hintergrund verwendet
 
 Die Rekonstruktion ist OCR-basiert. Je sauberer und hoeher aufgeloest die Vorlage ist, desto besser werden Textpositionen und Texterkennung.
 
