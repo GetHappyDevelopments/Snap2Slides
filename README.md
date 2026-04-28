@@ -26,6 +26,8 @@ python -m pip install --user -r requirements.txt
 - abgegrenzte Bildbereiche werden als eigene PowerPoint-Objekte exportiert; es wird kein Screenshot als Folien-Hintergrund verwendet
 - grosse zusammenhaengende Bildbereiche bleiben ein einzelnes Objekt und werden nicht in kleine Fragmente zerlegt
 - erkannter Text wird aus den Bildobjekten entfernt und danach als editierbares Textfeld neu eingefuegt
+- zusammengehoerige OCR-Zeilen werden zu Textbloecken gruppiert; Bullet-Zeilen werden als editierbare Listenzeilen rekonstruiert
+- Text wird pixelgenauer aus Bildobjekten entfernt, auch bei hellem Text auf dunkleren Bildbereichen
 
 Die Rekonstruktion ist OCR-basiert. Je sauberer und hoeher aufgeloest die Vorlage ist, desto besser werden Textpositionen und Texterkennung.
 

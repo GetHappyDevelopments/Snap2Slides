@@ -64,11 +64,30 @@ class Rect:
 
 
 @dataclass
-class TextBlock:
+class TextLine:
     rect: Rect
     text: str
     confidence: float
     color: RGBColor
+
+
+@dataclass
+class TextBlock:
+    rect: Rect
+    lines: list[TextLine]
+    bullet_lines: list[bool]
+
+    @property
+    def text(self) -> str:
+        return "\n".join(line.text for line in self.lines)
+
+    @property
+    def confidence(self) -> float:
+        return min(line.confidence for line in self.lines)
+
+    @property
+    def color(self) -> RGBColor:
+        return self.lines[0].color if self.lines else TEXT_BLACK
 
 
 @dataclass
@@ -161,6 +180,14 @@ def _box_to_rect(points: list[list[float]], max_w: int, max_h: int) -> Rect:
     return Rect(min(xs), min(ys), max(xs) - min(xs), max(ys) - min(ys)).padded(2, max_w, max_h)
 
 
+def _union_rect(rects: list[Rect], max_w: int, max_h: int, padding: int = 0) -> Rect:
+    x1 = min(rect.x for rect in rects)
+    y1 = min(rect.y for rect in rects)
+    x2 = max(rect.x2 for rect in rects)
+    y2 = max(rect.y2 for rect in rects)
+    return Rect(x1, y1, x2 - x1, y2 - y1).padded(padding, max_w, max_h)
+
+
 def _guess_text_color(arr: np.ndarray, rect: Rect) -> RGBColor:
     crop = arr[rect.y : rect.y2, rect.x : rect.x2]
     if crop.size == 0:
@@ -199,12 +226,38 @@ def _build_text_mask(width: int, height: int, text_rects: list[Rect], padding: i
     return mask
 
 
+def _build_text_pixel_mask(image: Image.Image, text_rects: list[Rect], padding: int = 6) -> np.ndarray:
+    arr = np.array(image.convert("RGB"))
+    gray = cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY)
+    hsv = cv2.cvtColor(arr, cv2.COLOR_RGB2HSV)
+    saturation = hsv[:, :, 1]
+    mask = np.zeros((image.height, image.width), dtype=np.uint8)
+
+    for rect in text_rects:
+        r = rect.padded(padding, image.width, image.height)
+        crop_gray = gray[r.y : r.y2, r.x : r.x2]
+        crop_sat = saturation[r.y : r.y2, r.x : r.x2]
+        if crop_gray.size == 0:
+            continue
+
+        median_gray = float(np.median(crop_gray))
+        if median_gray < 120:
+            local_pixels = (crop_gray > 155) | (np.abs(crop_gray.astype(np.int16) - int(median_gray)) > 55)
+        else:
+            local_pixels = (crop_gray < 185) | ((crop_gray < 225) & (crop_sat > 35))
+        local = local_pixels.astype(np.uint8) * 255
+        local = cv2.dilate(local, np.ones((3, 3), np.uint8), iterations=1)
+        mask[r.y : r.y2, r.x : r.x2] = np.maximum(mask[r.y : r.y2, r.x : r.x2], local)
+
+    return mask
+
+
 def _remove_text_from_image(image: Image.Image, text_rects: list[Rect]) -> Image.Image:
     if not text_rects:
         return image
 
     arr = np.array(image.convert("RGB"))
-    mask = _build_text_mask(image.width, image.height, text_rects, padding=2)
+    mask = _build_text_pixel_mask(image, text_rects, padding=6)
     if not np.any(mask):
         return image
 
@@ -256,6 +309,97 @@ def _dedupe_visuals(visuals: list[VisualBlock], max_w: int, max_h: int) -> list[
     return kept
 
 
+def _is_bullet_line(text: str) -> bool:
+    stripped = text.strip()
+    return stripped.startswith(("-", "*", "\u2022", "\u00b7", "\u2013", ">>", "\u00bb"))
+
+
+def _clean_line_text(text: str) -> tuple[str, bool]:
+    stripped = " ".join(text.split())
+    is_bullet = _is_bullet_line(stripped)
+    if is_bullet:
+        stripped = stripped.lstrip("-*\u2022\u00b7\u2013\u00bb> ").strip()
+    return stripped, is_bullet
+
+
+def _has_bullet_marker(arr: np.ndarray, rect: Rect) -> bool:
+    h, w = arr.shape[:2]
+    x1 = max(0, rect.x - max(12, rect.h * 2))
+    x2 = max(0, rect.x - 2)
+    y1 = max(0, rect.y - rect.h // 3)
+    y2 = min(h, rect.y2 + rect.h // 3)
+    if x2 <= x1 or y2 <= y1:
+        return False
+
+    crop = arr[y1:y2, x1:x2]
+    gray = cv2.cvtColor(crop, cv2.COLOR_RGB2GRAY)
+    hsv = cv2.cvtColor(crop, cv2.COLOR_RGB2HSV)
+    sat = hsv[:, :, 1]
+    mask = ((gray < 170) | ((gray < 230) & (sat > 45))).astype(np.uint8) * 255
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((2, 2), np.uint8), iterations=1)
+    num_labels, _labels, stats, _centroids = cv2.connectedComponentsWithStats(mask, 8)
+
+    max_area = max(12, rect.h * rect.h)
+    for label in range(1, num_labels):
+        _x, _y, bw, bh, area = stats[label]
+        if 4 <= area <= max_area and bw <= rect.h * 1.2 and bh <= rect.h * 1.2:
+            return True
+    return False
+
+
+def _lines_belong_together(previous: TextLine, current: TextLine) -> bool:
+    avg_h = max(1, (previous.rect.h + current.rect.h) / 2)
+    vertical_gap = current.rect.y - previous.rect.y2
+    if vertical_gap < -avg_h * 0.55 or vertical_gap > avg_h * 1.65:
+        return False
+
+    x_overlap = _intersection_area(
+        Rect(previous.rect.x, 0, previous.rect.w, 1), Rect(current.rect.x, 0, current.rect.w, 1)
+    )
+    overlap_ratio = x_overlap / max(1, min(previous.rect.w, current.rect.w))
+    left_delta = abs(previous.rect.x - current.rect.x)
+    center_delta = abs((previous.rect.x + previous.rect.x2) / 2 - (current.rect.x + current.rect.x2) / 2)
+
+    return overlap_ratio > 0.2 or left_delta <= avg_h * 3.2 or center_delta <= avg_h * 5.0
+
+
+def _group_text_lines(lines: list[TextLine], slide_image: Image.Image) -> list[TextBlock]:
+    if not lines:
+        return []
+
+    max_w, max_h = slide_image.width, slide_image.height
+    arr = np.array(slide_image.convert("RGB"))
+    sorted_lines = sorted(lines, key=lambda line: (line.rect.y, line.rect.x))
+    groups: list[list[TextLine]] = []
+    for line in sorted_lines:
+        if groups and _lines_belong_together(groups[-1][-1], line):
+            groups[-1].append(line)
+        else:
+            groups.append([line])
+
+    blocks: list[TextBlock] = []
+    for group in groups:
+        cleaned_lines: list[tuple[TextLine, bool]] = []
+        for line in group:
+            cleaned, is_bullet = _clean_line_text(line.text)
+            is_bullet = is_bullet or _has_bullet_marker(arr, line.rect)
+            if cleaned:
+                cleaned_lines.append((TextLine(line.rect, cleaned, line.confidence, line.color), is_bullet))
+        if not cleaned_lines:
+            continue
+
+        block_lines: list[TextLine] = []
+        bullet_flags: list[bool] = []
+        for line, is_bullet in cleaned_lines:
+            block_lines.append(line)
+            bullet_flags.append(is_bullet)
+
+        rect = _union_rect([line.rect for line in block_lines], max_w, max_h, padding=2)
+        blocks.append(TextBlock(rect, block_lines, bullet_flags))
+
+    return blocks
+
+
 def analyze_image(
     image_path: Path,
     confidence: float = MIN_TEXT_CONFIDENCE,
@@ -274,7 +418,7 @@ def analyze_image(
         slide_img = source.crop((rect.x, rect.y, rect.x2, rect.y2))
         arr = np.array(slide_img)
         result, _ = ocr(arr)
-        texts: list[TextBlock] = []
+        lines: list[TextLine] = []
 
         for item in result or []:
             points, text, score = item
@@ -285,8 +429,8 @@ def analyze_image(
             text_rect = _box_to_rect(points, slide_img.width, slide_img.height)
             if text_rect.w < 4 or text_rect.h < 4:
                 continue
-            texts.append(
-                TextBlock(
+            lines.append(
+                TextLine(
                     rect=text_rect,
                     text=cleaned,
                     confidence=score_float,
@@ -294,7 +438,8 @@ def analyze_image(
                 )
             )
 
-        visuals = _detect_visuals(slide_img, [t.rect for t in texts]) if include_visuals else []
+        texts = _group_text_lines(lines, slide_img)
+        visuals = _detect_visuals(slide_img, [line.rect for line in lines]) if include_visuals else []
         slides.append(AnalyzedSlide(rect=rect, image=slide_img, texts=texts, visuals=visuals))
         progress(f"Folie {index}: {len(texts)} Textfeld(er), {len(visuals)} Bildobjekt(e).")
 
@@ -304,8 +449,10 @@ def analyze_image(
 def _add_textbox(slide, block: TextBlock, scale_x: float, scale_y: float) -> None:
     left = int(block.rect.x * scale_x)
     top = int(block.rect.y * scale_y)
-    width = int(max(1, block.rect.w * scale_x * 1.08))
-    height = int(max(1, block.rect.h * scale_y * 1.35))
+    width = int(max(1, block.rect.w * scale_x * 1.12))
+    height = int(max(1, block.rect.h * scale_y * 1.45))
+    median_line_h = sorted(line.rect.h for line in block.lines)[len(block.lines) // 2]
+    font_size = Pt(max(7, min(30, median_line_h * scale_y / EMU_PER_INCH * 72 * 1.05)))
 
     box = slide.shapes.add_textbox(left, top, width, height)
     box.text_frame.margin_left = 0
@@ -313,11 +460,15 @@ def _add_textbox(slide, block: TextBlock, scale_x: float, scale_y: float) -> Non
     box.text_frame.margin_top = 0
     box.text_frame.margin_bottom = 0
     box.text_frame.word_wrap = True
-    p = box.text_frame.paragraphs[0]
-    p.text = block.text
-    p.font.name = "Aptos"
-    p.font.size = Pt(max(7, min(28, height / EMU_PER_INCH * 72 * 0.72)))
-    p.font.color.rgb = block.color
+    box.text_frame.clear()
+
+    for index, line in enumerate(block.lines):
+        p = box.text_frame.paragraphs[0] if index == 0 else box.text_frame.add_paragraph()
+        is_bullet = index < len(block.bullet_lines) and block.bullet_lines[index]
+        p.text = f"\u2022 {line.text}" if is_bullet else line.text
+        p.font.name = "Aptos"
+        p.font.size = font_size
+        p.font.color.rgb = line.color
 
 
 def export_pptx(slides: list[AnalyzedSlide], output_path: Path, progress: Callable[[str], None] | None = None) -> None:
