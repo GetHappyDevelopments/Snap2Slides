@@ -95,6 +95,7 @@ class TextBlock:
 class VisualBlock:
     rect: Rect
     image: Image.Image
+    kind: str = "visual"
 
 
 @dataclass
@@ -310,7 +311,7 @@ def _detect_text_containers(slide_image: Image.Image, text_blocks: list[TextBloc
     shapes: list[ShapeBlock] = []
 
     for block in text_blocks:
-        normalized_text = "".join(ch.lower() for ch in block.text if ch.isalnum())
+        normalized_text = _normalized_text(block.text)
         if len(normalized_text) <= 5 or normalized_text in {"msg", "6sw", "msq"}:
             continue
 
@@ -373,9 +374,29 @@ def _detect_visuals(slide_image: Image.Image, text_rects: list[Rect]) -> list[Vi
             continue
         rect = Rect(int(x), int(y), int(bw), int(bh)).padded(3, w, h)
         crop = visual_source.crop((rect.x, rect.y, rect.x2, rect.y2))
-        visuals.append(VisualBlock(rect=rect, image=crop))
+        visuals.append(VisualBlock(rect=rect, image=crop, kind=_classify_visual(arr, rect)))
 
     return _dedupe_visuals(visuals, w, h)
+
+
+def _classify_visual(arr: np.ndarray, rect: Rect) -> str:
+    crop = arr[rect.y : rect.y2, rect.x : rect.x2]
+    if crop.size == 0:
+        return "visual"
+
+    gray = cv2.cvtColor(crop, cv2.COLOR_RGB2GRAY)
+    color_std = float(np.mean(np.std(crop.reshape(-1, 3), axis=0)))
+    edge_density = float(np.mean(cv2.Canny(gray, 45, 130) > 0))
+    if (
+        rect.area > arr.shape[0] * arr.shape[1] * 0.04
+        and rect.w > arr.shape[1] * 0.16
+        and rect.h > arr.shape[0] * 0.16
+        and (color_std > 34 or edge_density > 0.06)
+    ):
+        return "photo"
+    if rect.area < arr.shape[0] * arr.shape[1] * 0.025 and (color_std > 18 or edge_density > 0.04):
+        return "logo"
+    return "visual"
 
 
 def _dedupe_visuals(visuals: list[VisualBlock], max_w: int, max_h: int) -> list[VisualBlock]:
@@ -412,7 +433,73 @@ def _clean_line_text(text: str) -> tuple[str, bool]:
     is_bullet = _is_bullet_line(stripped)
     if is_bullet:
         stripped = stripped.lstrip("-*\u2022\u00b7\u2013\u00bb> ").strip()
+    stripped = _strip_logo_noise(stripped)
     return stripped, is_bullet
+
+
+def _normalized_text(text: str) -> str:
+    return "".join(ch.lower() for ch in text if ch.isalnum())
+
+
+def _strip_logo_noise(text: str) -> str:
+    stripped = text.strip()
+    lowered = stripped.lower()
+    for suffix in (".msg", " msg", "-msg", ".msq", " msq", ".6sw", " 6sw"):
+        if lowered.endswith(suffix) and len(stripped) > len(suffix) + 6:
+            return stripped[: -len(suffix)].rstrip(" .,-")
+    return stripped
+
+
+def _looks_like_logo_text(text: str) -> bool:
+    normalized = _normalized_text(text)
+    known = {"msg", "msq", "6sw", "sap", "ai"}
+    return normalized in known or (2 <= len(normalized) <= 4 and any(ch.isalpha() for ch in normalized))
+
+
+def _line_is_in_logo_zone(line: TextLine, width: int, height: int) -> bool:
+    top_band = line.rect.y < height * 0.18
+    corner_band = line.rect.x < width * 0.22 or line.rect.x2 > width * 0.72
+    compact = line.rect.w < width * 0.22 and line.rect.h < height * 0.16
+    return top_band and corner_band and compact
+
+
+def _detect_logo_regions(slide_image: Image.Image, lines: list[TextLine]) -> list[VisualBlock]:
+    if not lines:
+        return []
+
+    arr = np.array(slide_image.convert("RGB"))
+    h, w = arr.shape[:2]
+    gray = cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY)
+    hsv = cv2.cvtColor(arr, cv2.COLOR_RGB2HSV)
+    saturation = hsv[:, :, 1]
+    content = ((gray < 245) | (saturation > 32)).astype(np.uint8) * 255
+    content = cv2.morphologyEx(content, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8), iterations=1)
+    num_labels, labels, stats, _centroids = cv2.connectedComponentsWithStats(content, 8)
+
+    logos: list[VisualBlock] = []
+    for line in lines:
+        if not (_looks_like_logo_text(line.text) and _line_is_in_logo_zone(line, w, h)):
+            continue
+
+        seed = line.rect.padded(max(8, line.rect.h), w, h)
+        seed_labels = labels[seed.y : seed.y2, seed.x : seed.x2]
+        label_ids, counts = np.unique(seed_labels[seed_labels > 0], return_counts=True)
+        rect = seed
+        if label_ids.size:
+            label = int(label_ids[int(np.argmax(counts))])
+            x, y, bw, bh, area = stats[label]
+            component = Rect(int(x), int(y), int(bw), int(bh)).padded(4, w, h)
+            if 20 <= area <= w * h * 0.08 and component.w <= w * 0.34 and component.h <= h * 0.22:
+                rect = component
+
+        crop = slide_image.crop((rect.x, rect.y, rect.x2, rect.y2))
+        logos.append(VisualBlock(rect=rect, image=crop, kind="logo"))
+
+    return _dedupe_visuals(logos, w, h)
+
+
+def _line_overlaps_protected_visual(line: TextLine, protected_visuals: list[VisualBlock]) -> bool:
+    return any(_overlap_ratio(line.rect, visual.rect) > 0.72 for visual in protected_visuals)
 
 
 def _has_bullet_marker(arr: np.ndarray, rect: Rect) -> bool:
@@ -531,11 +618,18 @@ def analyze_image(
                 )
             )
 
-        texts = _group_text_lines(lines, slide_img)
-        visuals = _detect_visuals(slide_img, [line.rect for line in lines]) if include_visuals else []
-        shapes = _detect_text_containers(slide_img, texts, [line.rect for line in lines])
+        protected_visuals = _detect_logo_regions(slide_img, lines)
+        editable_lines = [line for line in lines if not _line_overlaps_protected_visual(line, protected_visuals)]
+        texts = _group_text_lines(editable_lines, slide_img)
+        visuals = _detect_visuals(slide_img, [line.rect for line in editable_lines]) if include_visuals else []
+        visuals = _dedupe_visuals(visuals + protected_visuals, slide_img.width, slide_img.height)
+        shapes = _detect_text_containers(slide_img, texts, [line.rect for line in editable_lines])
         slides.append(AnalyzedSlide(rect=rect, image=slide_img, texts=texts, visuals=visuals, shapes=shapes))
-        progress(f"Folie {index}: {len(texts)} Textfeld(er), {len(visuals)} Bildobjekt(e), {len(shapes)} Flaeche(n).")
+        logo_count = sum(1 for visual in visuals if visual.kind == "logo")
+        progress(
+            f"Folie {index}: {len(texts)} Textfeld(er), {len(visuals)} Bildobjekt(e), "
+            f"{len(shapes)} Flaeche(n), {logo_count} Logo(s)."
+        )
 
     return slides
 
