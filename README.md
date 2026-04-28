@@ -28,6 +28,7 @@ python -m pip install --user -r requirements.txt
 - erkannter Text wird aus den Bildobjekten entfernt und danach als editierbares Textfeld neu eingefuegt
 - zusammengehoerige OCR-Zeilen werden zu Textbloecken gruppiert; Bullet-Zeilen werden als editierbare Listenzeilen rekonstruiert
 - Text wird pixelgenauer aus Bildobjekten entfernt, auch bei hellem Text auf dunkleren Bildbereichen
+- gleichmaessige Text-Tragerflaechen werden als echte PowerPoint-Rechtecke zwischen Bild- und Textebene rekonstruiert
 
 Die Rekonstruktion ist OCR-basiert. Je sauberer und hoeher aufgeloest die Vorlage ist, desto besser werden Textpositionen und Texterkennung.
 

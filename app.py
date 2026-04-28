@@ -15,6 +15,7 @@ import numpy as np
 from PIL import Image, ImageTk
 from pptx import Presentation
 from pptx.dml.color import RGBColor
+from pptx.enum.shapes import MSO_SHAPE
 from pptx.util import Pt
 from rapidocr_onnxruntime import RapidOCR
 import tkinter as tk
@@ -97,11 +98,18 @@ class VisualBlock:
 
 
 @dataclass
+class ShapeBlock:
+    rect: Rect
+    fill: RGBColor
+
+
+@dataclass
 class AnalyzedSlide:
     rect: Rect
     image: Image.Image
     texts: list[TextBlock]
     visuals: list[VisualBlock]
+    shapes: list[ShapeBlock]
 
 
 def _bands_from_mask(values: np.ndarray, min_width: int) -> list[tuple[int, int]]:
@@ -218,6 +226,14 @@ def _overlap_ratio(first: Rect, second: Rect) -> float:
     return _intersection_area(first, second) / smaller
 
 
+def _rect_fill_color(arr: np.ndarray, rect: Rect) -> RGBColor:
+    crop = arr[rect.y : rect.y2, rect.x : rect.x2]
+    if crop.size == 0:
+        return RGBColor(255, 255, 255)
+    median = np.median(crop.reshape(-1, 3), axis=0)
+    return RGBColor(int(median[0]), int(median[1]), int(median[2]))
+
+
 def _build_text_mask(width: int, height: int, text_rects: list[Rect], padding: int = 2) -> np.ndarray:
     mask = np.zeros((height, width), dtype=np.uint8)
     for rect in text_rects:
@@ -265,6 +281,70 @@ def _remove_text_from_image(image: Image.Image, text_rects: list[Rect]) -> Image
     return Image.fromarray(inpainted)
 
 
+def _component_rect_for_seed(mask: np.ndarray, seed_rect: Rect) -> Rect | None:
+    num_labels, labels, stats, _centroids = cv2.connectedComponentsWithStats(mask, 8)
+    if num_labels <= 1:
+        return None
+
+    y1 = max(0, seed_rect.y)
+    y2 = min(mask.shape[0], seed_rect.y2)
+    x1 = max(0, seed_rect.x)
+    x2 = min(mask.shape[1], seed_rect.x2)
+    seed_labels = labels[y1:y2, x1:x2]
+    label_ids, counts = np.unique(seed_labels[seed_labels > 0], return_counts=True)
+    if label_ids.size == 0:
+        return None
+
+    label = int(label_ids[int(np.argmax(counts))])
+    x, y, w, h, _area = stats[label]
+    return Rect(int(x), int(y), int(w), int(h))
+
+
+def _detect_text_containers(slide_image: Image.Image, text_blocks: list[TextBlock], text_rects: list[Rect]) -> list[ShapeBlock]:
+    if not text_blocks:
+        return []
+
+    cleaned_image = _remove_text_from_image(slide_image, text_rects)
+    arr = np.array(cleaned_image.convert("RGB"))
+    h, w = arr.shape[:2]
+    shapes: list[ShapeBlock] = []
+
+    for block in text_blocks:
+        normalized_text = "".join(ch.lower() for ch in block.text if ch.isalnum())
+        if len(normalized_text) <= 5 or normalized_text in {"msg", "6sw", "msq"}:
+            continue
+
+        seed = block.rect.padded(max(4, block.rect.h // 4), w, h)
+        seed_crop = arr[seed.y : seed.y2, seed.x : seed.x2]
+        if seed_crop.size == 0:
+            continue
+
+        median = np.median(seed_crop.reshape(-1, 3), axis=0)
+        seed_std = float(np.mean(np.std(seed_crop.reshape(-1, 3), axis=0)))
+        if seed_std > 58:
+            continue
+
+        distance = np.linalg.norm(arr.astype(np.int16) - median.astype(np.int16), axis=2)
+        threshold = 34 if seed_std < 22 else 46
+        similar = (distance < threshold).astype(np.uint8) * 255
+        similar = cv2.morphologyEx(similar, cv2.MORPH_CLOSE, np.ones((7, 7), np.uint8), iterations=2)
+        similar = cv2.morphologyEx(similar, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8), iterations=1)
+
+        rect = _component_rect_for_seed(similar, seed)
+        if rect is None:
+            continue
+        rect = rect.padded(1, w, h)
+        if rect.area < block.rect.area * 1.08 or rect.area > w * h * 0.86:
+            continue
+        if rect.w < block.rect.w * 0.9 or rect.h < block.rect.h * 0.9:
+            continue
+
+        fill = _rect_fill_color(arr, rect)
+        shapes.append(ShapeBlock(rect=rect, fill=fill))
+
+    return _dedupe_shapes(shapes, w, h)
+
+
 def _detect_visuals(slide_image: Image.Image, text_rects: list[Rect]) -> list[VisualBlock]:
     arr = np.array(slide_image.convert("RGB"))
     h, w = arr.shape[:2]
@@ -302,6 +382,19 @@ def _dedupe_visuals(visuals: list[VisualBlock], max_w: int, max_h: int) -> list[
     kept: list[VisualBlock] = []
     for candidate in sorted(visuals, key=lambda item: item.rect.area, reverse=True):
         if any(_overlap_ratio(candidate.rect, existing.rect) > 0.82 for existing in kept):
+            continue
+        kept.append(candidate)
+
+    kept.sort(key=lambda item: (item.rect.y, item.rect.x))
+    return kept
+
+
+def _dedupe_shapes(shapes: list[ShapeBlock], max_w: int, max_h: int) -> list[ShapeBlock]:
+    kept: list[ShapeBlock] = []
+    for candidate in sorted(shapes, key=lambda item: item.rect.area, reverse=True):
+        if candidate.rect.area > max_w * max_h * 0.86:
+            continue
+        if any(_overlap_ratio(candidate.rect, existing.rect) > 0.85 for existing in kept):
             continue
         kept.append(candidate)
 
@@ -440,8 +533,9 @@ def analyze_image(
 
         texts = _group_text_lines(lines, slide_img)
         visuals = _detect_visuals(slide_img, [line.rect for line in lines]) if include_visuals else []
-        slides.append(AnalyzedSlide(rect=rect, image=slide_img, texts=texts, visuals=visuals))
-        progress(f"Folie {index}: {len(texts)} Textfeld(er), {len(visuals)} Bildobjekt(e).")
+        shapes = _detect_text_containers(slide_img, texts, [line.rect for line in lines])
+        slides.append(AnalyzedSlide(rect=rect, image=slide_img, texts=texts, visuals=visuals, shapes=shapes))
+        progress(f"Folie {index}: {len(texts)} Textfeld(er), {len(visuals)} Bildobjekt(e), {len(shapes)} Flaeche(n).")
 
     return slides
 
@@ -502,6 +596,18 @@ def export_pptx(slides: list[AnalyzedSlide], output_path: Path, progress: Callab
                     width=int(visual.rect.w * scale_x),
                     height=int(visual.rect.h * scale_y),
                 )
+
+            for shape in analyzed.shapes:
+                rect = slide.shapes.add_shape(
+                    MSO_SHAPE.RECTANGLE,
+                    int(shape.rect.x * scale_x),
+                    int(shape.rect.y * scale_y),
+                    int(shape.rect.w * scale_x),
+                    int(shape.rect.h * scale_y),
+                )
+                rect.fill.solid()
+                rect.fill.fore_color.rgb = shape.fill
+                rect.line.fill.background()
 
             for block in analyzed.texts:
                 _add_textbox(slide, block, scale_x, scale_y)
