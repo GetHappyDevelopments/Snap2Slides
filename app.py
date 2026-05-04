@@ -25,6 +25,7 @@ from tkinter import filedialog, messagebox, ttk
 EMU_PER_INCH = 914400
 SLIDE_WIDTH_IN = 13.333333
 MIN_TEXT_CONFIDENCE = 0.45
+EXPORT_MODES = ("visual_safe", "editable", "reconstruct")
 BURGUNDY = RGBColor(137, 13, 64)
 TEXT_BLACK = RGBColor(20, 20, 20)
 APP_ROOT = Path(__file__).resolve().parent
@@ -227,6 +228,27 @@ def _overlap_ratio(first: Rect, second: Rect) -> float:
     return _intersection_area(first, second) / smaller
 
 
+def _merge_rects(rects: list[Rect], overlap_threshold: float = 0.2) -> list[Rect]:
+    if not rects:
+        return []
+
+    merged: list[Rect] = []
+    for rect in sorted(rects, key=lambda item: (item.y, item.x)):
+        for index, existing in enumerate(merged):
+            intersection = _intersection_area(rect, existing)
+            union = rect.area + existing.area - intersection
+            if union > 0 and intersection / union > overlap_threshold:
+                x1 = min(rect.x, existing.x)
+                y1 = min(rect.y, existing.y)
+                x2 = max(rect.x2, existing.x2)
+                y2 = max(rect.y2, existing.y2)
+                merged[index] = Rect(x1, y1, x2 - x1, y2 - y1)
+                break
+        else:
+            merged.append(rect)
+    return merged
+
+
 def _rect_fill_color(arr: np.ndarray, rect: Rect) -> RGBColor:
     crop = arr[rect.y : rect.y2, rect.x : rect.x2]
     if crop.size == 0:
@@ -377,6 +399,53 @@ def _detect_visuals(slide_image: Image.Image, text_rects: list[Rect]) -> list[Vi
         visuals.append(VisualBlock(rect=rect, image=crop, kind=_classify_visual(arr, rect)))
 
     return _dedupe_visuals(visuals, w, h)
+
+
+def _detect_magenta_icons(slide_image: Image.Image, exclude_rects: list[Rect]) -> list[VisualBlock]:
+    arr = np.array(slide_image.convert("RGB"))
+    h, w = arr.shape[:2]
+    hsv = cv2.cvtColor(arr, cv2.COLOR_RGB2HSV)
+
+    magenta_red = cv2.bitwise_or(
+        cv2.inRange(hsv, np.array([145, 45, 35]), np.array([180, 255, 255])),
+        cv2.inRange(hsv, np.array([0, 45, 35]), np.array([16, 255, 255])),
+    )
+    magenta_red = cv2.morphologyEx(magenta_red, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8), iterations=1)
+
+    contours, _ = cv2.findContours(magenta_red, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    candidates: list[Rect] = []
+    for contour in contours:
+        x, y, bw, bh = cv2.boundingRect(contour)
+        rect = Rect(int(x), int(y), int(bw), int(bh)).padded(6, w, h)
+        area_ratio = rect.area / max(1, w * h)
+        aspect = rect.w / max(1, rect.h)
+        if rect.area < 50 or area_ratio > 0.08 or aspect > 6.0 or aspect < 0.15:
+            continue
+        if any(_overlap_ratio(rect, text_rect) > 0.35 for text_rect in exclude_rects):
+            continue
+        candidates.append(rect)
+
+    icons: list[VisualBlock] = []
+    for rect in _merge_rects(candidates, overlap_threshold=0.08):
+        crop = arr[rect.y : rect.y2, rect.x : rect.x2]
+        if crop.size == 0:
+            continue
+
+        crop_hsv = cv2.cvtColor(crop, cv2.COLOR_RGB2HSV)
+        crop_gray = cv2.cvtColor(crop, cv2.COLOR_RGB2GRAY)
+        alpha = cv2.bitwise_or(
+            cv2.inRange(crop_hsv, np.array([145, 35, 25]), np.array([180, 255, 255])),
+            cv2.inRange(crop_hsv, np.array([0, 35, 25]), np.array([16, 255, 255])),
+        )
+        alpha = cv2.bitwise_or(alpha, cv2.inRange(crop_gray, 0, 78))
+        alpha = cv2.morphologyEx(alpha, cv2.MORPH_CLOSE, np.ones((2, 2), np.uint8), iterations=1)
+        if np.count_nonzero(alpha) < 20:
+            continue
+
+        rgba = np.dstack([crop, alpha])
+        icons.append(VisualBlock(rect=rect, image=Image.fromarray(rgba), kind="icon"))
+
+    return _dedupe_visuals(icons, w, h)
 
 
 def _classify_visual(arr: np.ndarray, rect: Rect) -> str:
@@ -621,14 +690,16 @@ def analyze_image(
         protected_visuals = _detect_logo_regions(slide_img, lines)
         editable_lines = [line for line in lines if not _line_overlaps_protected_visual(line, protected_visuals)]
         texts = _group_text_lines(editable_lines, slide_img)
+        icons = _detect_magenta_icons(slide_img, [line.rect for line in editable_lines])
         visuals = _detect_visuals(slide_img, [line.rect for line in editable_lines]) if include_visuals else []
-        visuals = _dedupe_visuals(visuals + protected_visuals, slide_img.width, slide_img.height)
+        visuals = _dedupe_visuals(icons + visuals + protected_visuals, slide_img.width, slide_img.height)
         shapes = _detect_text_containers(slide_img, texts, [line.rect for line in editable_lines])
         slides.append(AnalyzedSlide(rect=rect, image=slide_img, texts=texts, visuals=visuals, shapes=shapes))
         logo_count = sum(1 for visual in visuals if visual.kind == "logo")
+        icon_count = sum(1 for visual in visuals if visual.kind == "icon")
         progress(
             f"Folie {index}: {len(texts)} Textfeld(er), {len(visuals)} Bildobjekt(e), "
-            f"{len(shapes)} Flaeche(n), {logo_count} Logo(s)."
+            f"{len(shapes)} Flaeche(n), {logo_count} Logo(s), {icon_count} Icon(s)."
         )
 
     return slides
@@ -659,11 +730,24 @@ def _add_textbox(slide, block: TextBlock, scale_x: float, scale_y: float) -> Non
         p.font.color.rgb = line.color
 
 
-def export_pptx(slides: list[AnalyzedSlide], output_path: Path, progress: Callable[[str], None] | None = None) -> None:
+def _add_image_to_slide(slide, image: Image.Image, image_path: Path, left: int, top: int, width: int, height: int) -> None:
+    image.save(image_path)
+    slide.shapes.add_picture(str(image_path), left, top, width=width, height=height)
+
+
+def export_pptx(
+    slides: list[AnalyzedSlide],
+    output_path: Path,
+    progress: Callable[[str], None] | None = None,
+    mode: str = "visual_safe",
+) -> None:
     if not slides:
         raise ValueError("Keine Folien zum Exportieren gefunden.")
+    if mode not in EXPORT_MODES:
+        raise ValueError(f"Unbekannter Exportmodus: {mode}")
 
     progress = progress or (lambda _: None)
+    progress(f"Exportmodus: {mode}.")
     prs = Presentation()
     first = slides[0].image
     slide_height_in = SLIDE_WIDTH_IN * first.height / first.width
@@ -680,28 +764,43 @@ def export_pptx(slides: list[AnalyzedSlide], output_path: Path, progress: Callab
             scale_x = prs.slide_width / analyzed.image.width
             scale_y = prs.slide_height / analyzed.image.height
 
-            for visual_index, visual in enumerate(analyzed.visuals, start=1):
+            if mode in {"visual_safe", "editable"}:
+                background = analyzed.image
+                if mode == "editable":
+                    line_rects = [line.rect for block in analyzed.texts for line in block.lines]
+                    background = _remove_text_from_image(analyzed.image, line_rects)
+                bg_path = temp_root / f"slide_{index:03d}_background.png"
+                _add_image_to_slide(slide, background, bg_path, 0, 0, int(prs.slide_width), int(prs.slide_height))
+
+            if mode == "reconstruct":
+                export_visuals = analyzed.visuals
+            else:
+                export_visuals = [visual for visual in analyzed.visuals if visual.kind in {"icon", "logo"}]
+
+            for visual_index, visual in enumerate(export_visuals, start=1):
                 image_path = temp_root / f"slide_{index:03d}_visual_{visual_index:03d}.png"
-                visual.image.save(image_path)
-                slide.shapes.add_picture(
-                    str(image_path),
+                _add_image_to_slide(
+                    slide,
+                    visual.image,
+                    image_path,
                     int(visual.rect.x * scale_x),
                     int(visual.rect.y * scale_y),
-                    width=int(visual.rect.w * scale_x),
-                    height=int(visual.rect.h * scale_y),
+                    int(visual.rect.w * scale_x),
+                    int(visual.rect.h * scale_y),
                 )
 
-            for shape in analyzed.shapes:
-                rect = slide.shapes.add_shape(
-                    MSO_SHAPE.RECTANGLE,
-                    int(shape.rect.x * scale_x),
-                    int(shape.rect.y * scale_y),
-                    int(shape.rect.w * scale_x),
-                    int(shape.rect.h * scale_y),
-                )
-                rect.fill.solid()
-                rect.fill.fore_color.rgb = shape.fill
-                rect.line.fill.background()
+            if mode == "reconstruct":
+                for shape in analyzed.shapes:
+                    rect = slide.shapes.add_shape(
+                        MSO_SHAPE.RECTANGLE,
+                        int(shape.rect.x * scale_x),
+                        int(shape.rect.y * scale_y),
+                        int(shape.rect.w * scale_x),
+                        int(shape.rect.h * scale_y),
+                    )
+                    rect.fill.solid()
+                    rect.fill.fore_color.rgb = shape.fill
+                    rect.line.fill.background()
 
             for block in analyzed.texts:
                 _add_textbox(slide, block, scale_x, scale_y)
@@ -715,9 +814,10 @@ def convert_image_to_pptx(
     confidence: float = MIN_TEXT_CONFIDENCE,
     include_visuals: bool = True,
     progress: Callable[[str], None] | None = None,
+    mode: str = "visual_safe",
 ) -> None:
     slides = analyze_image(image_path, confidence, include_visuals, progress)
-    export_pptx(slides, output_path, progress)
+    export_pptx(slides, output_path, progress, mode)
 
 
 def configure_windows_taskbar_icon() -> None:
@@ -776,6 +876,7 @@ class Image2PptApp(tk.Tk):
         self.confidence = tk.DoubleVar(value=MIN_TEXT_CONFIDENCE)
         self.confidence_label = tk.StringVar()
         self.include_visuals = tk.BooleanVar(value=True)
+        self.export_mode = tk.StringVar(value="visual_safe")
         self.status_text = tk.StringVar(value="Bereit")
         self._preview_image: ImageTk.PhotoImage | None = None
         self._preview_source: Image.Image | None = None
@@ -834,6 +935,15 @@ class Image2PptApp(tk.Tk):
         ttk.Label(options, textvariable=self.confidence_label, width=4).pack(side=tk.LEFT)
         self.visuals_check = ttk.Checkbutton(options, text="Bildobjekte erkennen", variable=self.include_visuals)
         self.visuals_check.pack(side=tk.LEFT, padx=16)
+        ttk.Label(options, text="Modus").pack(side=tk.LEFT, padx=(0, 6))
+        self.mode_select = ttk.Combobox(
+            options,
+            textvariable=self.export_mode,
+            values=EXPORT_MODES,
+            width=13,
+            state="readonly",
+        )
+        self.mode_select.pack(side=tk.LEFT)
         self.convert_button = ttk.Button(options, text="PPTX erzeugen", command=self._start_conversion)
         self.convert_button.pack(side=tk.RIGHT)
         self.open_output_button = ttk.Button(
@@ -952,14 +1062,22 @@ class Image2PptApp(tk.Tk):
         self._append_log("Starte Umwandlung ...")
         worker = threading.Thread(
             target=self._run_conversion,
-            args=(input_path, output_path, float(self.confidence.get()), bool(self.include_visuals.get())),
+            args=(
+                input_path,
+                output_path,
+                float(self.confidence.get()),
+                bool(self.include_visuals.get()),
+                self.export_mode.get(),
+            ),
             daemon=True,
         )
         worker.start()
 
-    def _run_conversion(self, input_path: Path, output_path: Path, confidence: float, include_visuals: bool) -> None:
+    def _run_conversion(
+        self, input_path: Path, output_path: Path, confidence: float, include_visuals: bool, mode: str
+    ) -> None:
         try:
-            convert_image_to_pptx(input_path, output_path, confidence, include_visuals, self._thread_log)
+            convert_image_to_pptx(input_path, output_path, confidence, include_visuals, self._thread_log, mode)
         except Exception as exc:
             self.after(0, messagebox.showerror, "Umwandlung fehlgeschlagen", str(exc))
             self._thread_log(f"Fehler: {exc}")
@@ -974,6 +1092,7 @@ class Image2PptApp(tk.Tk):
         state = tk.DISABLED if is_running else tk.NORMAL
         self.convert_button.configure(state=state)
         self.visuals_check.configure(state=state)
+        self.mode_select.configure(state=tk.DISABLED if is_running else "readonly")
         if is_running:
             self.progress.start(12)
         else:
@@ -1002,6 +1121,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output", "-o", type=Path)
     parser.add_argument("--confidence", type=float, default=MIN_TEXT_CONFIDENCE)
     parser.add_argument("--no-visuals", action="store_true")
+    parser.add_argument("--mode", choices=EXPORT_MODES, default="visual_safe")
     return parser.parse_args()
 
 
@@ -1014,6 +1134,7 @@ def main() -> None:
             confidence=args.confidence,
             include_visuals=not args.no_visuals,
             progress=print,
+            mode=args.mode,
         )
         return
 

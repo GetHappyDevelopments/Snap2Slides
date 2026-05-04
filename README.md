@@ -20,6 +20,9 @@ python -m pip install --user -r requirements.txt
 
 ## Was erzeugt wird
 
+- Standardmodus `visual_safe`: jeder erkannte Slide-Ausschnitt wird als optisch sicherer Hintergrund eingefuegt; OCR-Texte und kleine Icons liegen als separat bearbeitbare Objekte darueber
+- optionaler Modus `editable`: erkannte Textpixel werden im Hintergrund neutralisiert und danach als editierbare Textfelder neu aufgebaut
+- optionaler Modus `reconstruct`: erkannte Bilder, Formen und Texte werden moeglichst separat rekonstruiert, ohne den kompletten Slide-Hintergrund einzufuegen
 - erkannte Einzel-Folien werden zu separaten PowerPoint-Folien
 - OCR-Texte werden als editierbare Textfelder eingefuegt
 - erkannte visuelle Flaechen wie Fotos, Logos, Icons, Diagramme oder farbige Boxen werden als einzelne Bildobjekte eingefuegt
@@ -37,6 +40,7 @@ Die Rekonstruktion ist OCR-basiert. Je sauberer und hoeher aufgeloest die Vorlag
 ## Bedienung
 
 - Bild auswaehlen, Zielpfad pruefen und `PPTX erzeugen` starten
+- `visual_safe` ist der empfohlene Standardmodus, weil Fotos und Hintergruende dabei stabil erhalten bleiben
 - beim Start zeigt Snap2Slides mindestens 3 Sekunden lang den Splash-Screen
 - falls Abhaengigkeiten fehlen, installiert der Launcher sie waehrend der Splash-Screen sichtbar bleibt
 - waehrend der Umwandlung zeigt die Statusleiste den aktuellen Schritt
@@ -45,3 +49,9 @@ Die Rekonstruktion ist OCR-basiert. Je sauberer und hoeher aufgeloest die Vorlag
 
 Das Programm nutzt `assets/app_icon.ico` als Windows-/Taskbar-Icon.
 Der Splash-Screen liegt unter `assets/splash.png`.
+
+## CLI
+
+```powershell
+python app.py --input tests\Bild.png --output tests\Bild.pptx --mode visual_safe
+```
