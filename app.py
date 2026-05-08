@@ -31,6 +31,7 @@ SLIDE_HEIGHT_IN = 7.5
 MIN_TEXT_CONFIDENCE = 0.45
 OCR_IMAGE_SCALE = 3
 EXPORT_MODES = ("pixel", "hybrid", "vector", "visual_safe", "editable", "styled_reconstruct", "reconstruct")
+DEFAULT_EXPORT_MODE = "hybrid"
 BURGUNDY = RGBColor(137, 13, 64)
 REFERENCE_ACCENT = RGBColor(154, 14, 62)
 REFERENCE_TEXT = RGBColor(17, 17, 17)
@@ -1790,7 +1791,7 @@ def export_pptx(
     if debug_dir is not None:
         debug_dir.mkdir(parents=True, exist_ok=True)
     progress = progress or (lambda _: None)
-    progress(f"Exportmodus: {mode}.")
+    progress("Automatische Rekonstruktion.") if mode == DEFAULT_EXPORT_MODE else progress(f"Exportmodus: {mode}.")
     prs = Presentation()
     prs.slide_width = int(config.slide_width_inches * EMU_PER_INCH)
     prs.slide_height = int(config.slide_height_inches * EMU_PER_INCH)
@@ -1962,6 +1963,20 @@ def _set_text_block_text(block: TextBlock, text: str) -> TextBlock:
     return TextBlock(block.rect, text_lines, bullet_flags, block.order)
 
 
+def _merge_text_blocks(blocks: list[TextBlock], slide_w: int, slide_h: int) -> TextBlock:
+    if not blocks:
+        raise ValueError("Keine Textbloecke zum Zusammenfuehren ausgewaehlt.")
+
+    ordered = _sort_text_blocks_reading_order(list(blocks), slide_w)
+    rect = _union_rect([block.rect for block in ordered], slide_w, slide_h, padding=2)
+    lines: list[TextLine] = []
+    bullet_flags: list[bool] = []
+    for block in ordered:
+        lines.extend(block.lines)
+        bullet_flags.extend(block.bullet_lines)
+    return TextBlock(rect, lines, bullet_flags, min(block.order for block in ordered))
+
+
 class ReconstructionEditor(tk.Toplevel):
     def __init__(
         self,
@@ -1971,20 +1986,28 @@ class ReconstructionEditor(tk.Toplevel):
     ) -> None:
         super().__init__(parent)
         self.title("Folien-Rekonstruktion bearbeiten")
-        self.geometry("1040x680")
-        self.minsize(880, 560)
+        self.geometry("1280x820")
+        self.minsize(1040, 680)
         self.transient(parent)
         self.slides = slides
         self.on_export = on_export
         self.slide_index = 0
         self.selected: tuple[str, int] | None = None
-        self.drag_start: tuple[int, int, Rect] | None = None
+        self.selected_items: set[tuple[str, int]] = set()
+        self.drag_start: tuple[int, int, dict[tuple[str, int], Rect]] | None = None
+        self.selection_start: tuple[int, int] | None = None
+        self.selection_rect_id: int | None = None
         self.scale = 1.0
         self._canvas_photo: ImageTk.PhotoImage | None = None
         self._item_map: dict[int, tuple[str, int]] = {}
+        self._render_after_id: str | None = None
 
         self._build_editor_ui()
         self._render_slide()
+        try:
+            self.state("zoomed")
+        except tk.TclError:
+            pass
         self.grab_set()
 
     def _build_editor_ui(self) -> None:
@@ -1996,32 +2019,53 @@ class ReconstructionEditor(tk.Toplevel):
         main.rowconfigure(1, weight=1)
 
         toolbar = ttk.Frame(main)
-        toolbar.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 8))
+        toolbar.grid(row=0, column=0, sticky="ew", pady=(0, 8))
         ttk.Button(toolbar, text="Vorherige", command=lambda: self._change_slide(-1)).pack(side=tk.LEFT)
         ttk.Button(toolbar, text="Naechste", command=lambda: self._change_slide(1)).pack(side=tk.LEFT, padx=(6, 12))
         self.slide_label = ttk.Label(toolbar, text="")
         self.slide_label.pack(side=tk.LEFT)
         ttk.Button(toolbar, text="PPTX erzeugen", command=self._finish).pack(side=tk.RIGHT)
 
-        self.canvas = tk.Canvas(main, background="#f4f4f4", highlightthickness=1, highlightbackground="#b7b7b7")
-        self.canvas.grid(row=1, column=0, sticky="nsew")
+        panes = tk.PanedWindow(
+            main,
+            orient=tk.HORIZONTAL,
+            sashwidth=8,
+            sashrelief=tk.RAISED,
+            background="#c8c8c8",
+            borderwidth=0,
+        )
+        panes.grid(row=1, column=0, sticky="nsew")
+
+        work_area = ttk.Frame(panes)
+        work_area.columnconfigure(0, weight=1)
+        work_area.rowconfigure(0, weight=1)
+        self.canvas = tk.Canvas(work_area, background="#f4f4f4", highlightthickness=1, highlightbackground="#b7b7b7")
+        self.canvas.grid(row=0, column=0, sticky="nsew")
         self.canvas.bind("<Button-1>", self._select_at)
         self.canvas.bind("<B1-Motion>", self._drag_selected)
         self.canvas.bind("<ButtonRelease-1>", lambda _event: self._stop_drag())
+        self.canvas.bind("<Configure>", self._schedule_render)
 
-        side = ttk.Frame(main, width=260)
-        side.grid(row=1, column=1, sticky="ns", padx=(12, 0))
-        side.grid_propagate(False)
-        ttk.Label(side, text="Text").pack(anchor="w")
+        side = ttk.Frame(panes, padding=(12, 0, 0, 0))
+        side.columnconfigure(0, weight=1)
+        side.rowconfigure(1, weight=1)
+        ttk.Label(side, text="Text").grid(row=0, column=0, sticky="w")
         self.text_editor = tk.Text(side, height=9, wrap=tk.WORD)
-        self.text_editor.pack(fill=tk.X, pady=(4, 8))
-        ttk.Button(side, text="Text uebernehmen", command=self._apply_text).pack(fill=tk.X)
-        ttk.Separator(side).pack(fill=tk.X, pady=10)
-        ttk.Button(side, text="Groesser", command=lambda: self._scale_selected(1.08)).pack(fill=tk.X)
-        ttk.Button(side, text="Kleiner", command=lambda: self._scale_selected(0.92)).pack(fill=tk.X, pady=(4, 0))
-        ttk.Button(side, text="Bild ersetzen", command=self._replace_visual).pack(fill=tk.X, pady=(12, 0))
+        self.text_editor.grid(row=1, column=0, sticky="nsew", pady=(4, 8))
+        self.apply_text_button = ttk.Button(side, text="Text uebernehmen", command=self._apply_text)
+        self.apply_text_button.grid(row=2, column=0, sticky="ew")
+        self.merge_button = ttk.Button(side, text="Textbloecke zusammenfuehren", command=self._merge_selected_text_blocks)
+        self.merge_button.grid(row=3, column=0, sticky="ew", pady=(6, 0))
+        ttk.Separator(side).grid(row=4, column=0, sticky="ew", pady=10)
+        ttk.Button(side, text="Groesser", command=lambda: self._scale_selected(1.08)).grid(row=5, column=0, sticky="ew")
+        ttk.Button(side, text="Kleiner", command=lambda: self._scale_selected(0.92)).grid(row=6, column=0, sticky="ew", pady=(4, 0))
+        ttk.Button(side, text="Bild ersetzen", command=self._replace_visual).grid(row=7, column=0, sticky="ew", pady=(12, 0))
         self.selection_label = ttk.Label(side, text="Kein Objekt ausgewaehlt", wraplength=240)
-        self.selection_label.pack(anchor="w", pady=(14, 0))
+        self.selection_label.grid(row=8, column=0, sticky="ew", pady=(14, 0))
+
+        panes.add(work_area, minsize=760, stretch="always")
+        panes.add(side, minsize=260)
+        self.after_idle(lambda: panes.sash_place(0, max(760, self.winfo_width() - 330), 0))
 
     @property
     def current_slide(self) -> AnalyzedSlide:
@@ -2030,12 +2074,20 @@ class ReconstructionEditor(tk.Toplevel):
     def _change_slide(self, delta: int) -> None:
         self.slide_index = max(0, min(len(self.slides) - 1, self.slide_index + delta))
         self.selected = None
+        self.selected_items.clear()
         self._render_slide()
 
+    def _schedule_render(self, _event: tk.Event | None = None) -> None:
+        if self._render_after_id is not None:
+            self.after_cancel(self._render_after_id)
+        self._render_after_id = self.after(80, self._render_slide)
+
     def _render_slide(self) -> None:
+        self._render_after_id = None
         slide = self.current_slide
         self.canvas.delete("all")
         self._item_map.clear()
+        self.selection_rect_id = None
         canvas_w = max(360, self.canvas.winfo_width() or 720)
         canvas_h = max(240, self.canvas.winfo_height() or 420)
         self.scale = min((canvas_w - 20) / slide.image.width, (canvas_h - 20) / slide.image.height)
@@ -2057,7 +2109,7 @@ class ReconstructionEditor(tk.Toplevel):
         y1 = 10 + rect.y * self.scale
         x2 = 10 + rect.x2 * self.scale
         y2 = 10 + rect.y2 * self.scale
-        width = 3 if self.selected == (kind, index) else 2
+        width = 3 if (kind, index) in self.selected_items else 2
         item = self.canvas.create_rectangle(x1, y1, x2, y2, outline=color, width=width)
         self._item_map[item] = (kind, index)
         if kind == "text":
@@ -2067,49 +2119,111 @@ class ReconstructionEditor(tk.Toplevel):
 
     def _select_at(self, event: tk.Event) -> None:
         hits = self.canvas.find_overlapping(event.x - 2, event.y - 2, event.x + 2, event.y + 2)
-        self.selected = None
+        hit: tuple[str, int] | None = None
         for item in reversed(hits):
             if item in self._item_map:
-                self.selected = self._item_map[item]
+                hit = self._item_map[item]
                 break
-        if self.selected is not None:
-            rect = self._selected_rect()
-            if rect is not None:
-                self.drag_start = (event.x, event.y, rect)
+        if hit is None:
+            self.selected = None
+            self.selected_items.clear()
+            self.selection_start = (event.x, event.y)
+            self.selection_rect_id = self.canvas.create_rectangle(
+                event.x,
+                event.y,
+                event.x,
+                event.y,
+                outline="#1f6feb",
+                dash=(4, 3),
+                width=2,
+            )
+            self._update_selection_panel()
+            return
+
+        if event.state & 0x0004:
+            if hit in self.selected_items:
+                self.selected_items.remove(hit)
+            else:
+                self.selected_items.add(hit)
+        elif hit not in self.selected_items:
+            self.selected_items = {hit}
+        self.selected = hit if hit in self.selected_items else next(iter(self.selected_items), None)
+        drag_rects = {item: rect for item in self.selected_items if (rect := self._item_rect(item)) is not None}
+        if drag_rects:
+            self.drag_start = (event.x, event.y, drag_rects)
         self._render_slide()
 
     def _selected_rect(self) -> Rect | None:
         if self.selected is None:
             return None
-        kind, index = self.selected
+        return self._item_rect(self.selected)
+
+    def _item_rect(self, item: tuple[str, int]) -> Rect | None:
+        kind, index = item
         if kind == "text" and index < len(self.current_slide.texts):
             return self.current_slide.texts[index].rect
         if kind == "visual" and index < len(self.current_slide.visuals):
             return self.current_slide.visuals[index].rect
         return None
 
-    def _set_selected_rect(self, rect: Rect) -> None:
-        if self.selected is None:
-            return
-        kind, index = self.selected
+    def _set_item_rect(self, item: tuple[str, int], rect: Rect) -> None:
+        kind, index = item
         slide = self.current_slide
         if kind == "text" and index < len(slide.texts):
             slide.texts[index] = _move_text_block(slide.texts[index], rect)
         elif kind == "visual" and index < len(slide.visuals):
             slide.visuals[index].rect = rect
 
+    def _set_selected_rect(self, rect: Rect) -> None:
+        if self.selected is not None:
+            self._set_item_rect(self.selected, rect)
+
     def _drag_selected(self, event: tk.Event) -> None:
+        if self.selection_start is not None:
+            if self.selection_rect_id is not None:
+                self.canvas.coords(self.selection_rect_id, self.selection_start[0], self.selection_start[1], event.x, event.y)
+            return
         if self.drag_start is None:
             return
-        start_x, start_y, rect = self.drag_start
+        start_x, start_y, rects = self.drag_start
         dx = int((event.x - start_x) / max(self.scale, 0.001))
         dy = int((event.y - start_y) / max(self.scale, 0.001))
         slide = self.current_slide
-        self._set_selected_rect(rect.moved(rect.x + dx, rect.y + dy, slide.image.width, slide.image.height))
+        for item, rect in rects.items():
+            self._set_item_rect(item, rect.moved(rect.x + dx, rect.y + dy, slide.image.width, slide.image.height))
         self._render_slide()
 
     def _stop_drag(self) -> None:
+        if self.selection_start is not None:
+            self._select_text_blocks_in_canvas_rect(self.selection_start)
+            self.selection_start = None
+            self.selection_rect_id = None
+            self._render_slide()
+            return
         self.drag_start = None
+
+    def _canvas_to_slide(self, x: int, y: int) -> tuple[int, int]:
+        return int((x - 10) / max(self.scale, 0.001)), int((y - 10) / max(self.scale, 0.001))
+
+    def _select_text_blocks_in_canvas_rect(self, start: tuple[int, int]) -> None:
+        end_x = self.canvas.winfo_pointerx() - self.canvas.winfo_rootx()
+        end_y = self.canvas.winfo_pointery() - self.canvas.winfo_rooty()
+        x1, x2 = sorted((start[0], end_x))
+        y1, y2 = sorted((start[1], end_y))
+        if abs(x2 - x1) < 4 or abs(y2 - y1) < 4:
+            self.selected = None
+            self.selected_items.clear()
+            return
+        sx1, sy1 = self._canvas_to_slide(x1, y1)
+        sx2, sy2 = self._canvas_to_slide(x2, y2)
+        selection = Rect(min(sx1, sx2), min(sy1, sy2), abs(sx2 - sx1), abs(sy2 - sy1))
+        selected = {
+            ("text", index)
+            for index, block in enumerate(self.current_slide.texts)
+            if _intersection_area(selection, block.rect) > 0
+        }
+        self.selected_items = selected
+        self.selected = next(iter(selected), None)
 
     def _scale_selected(self, factor: float) -> None:
         rect = self._selected_rect()
@@ -2121,6 +2235,16 @@ class ReconstructionEditor(tk.Toplevel):
 
     def _update_selection_panel(self) -> None:
         self.text_editor.delete("1.0", tk.END)
+        text_selection = sorted(index for kind, index in self.selected_items if kind == "text")
+        self.merge_button.configure(state=tk.NORMAL if len(text_selection) >= 2 else tk.DISABLED)
+        if len(text_selection) >= 2:
+            self.apply_text_button.configure(state=tk.DISABLED)
+            selected_blocks = [self.current_slide.texts[index] for index in text_selection]
+            merged_preview = "\n".join(block.text for block in _sort_text_blocks_reading_order(selected_blocks, self.current_slide.image.width))
+            self.text_editor.insert("1.0", merged_preview)
+            self.selection_label.configure(text=f"{len(text_selection)} Textbloecke ausgewaehlt")
+            return
+        self.apply_text_button.configure(state=tk.NORMAL if self.selected is not None and self.selected[0] == "text" else tk.DISABLED)
         if self.selected is None:
             self.selection_label.configure(text="Kein Objekt ausgewaehlt")
             return
@@ -2138,6 +2262,22 @@ class ReconstructionEditor(tk.Toplevel):
             return
         index = self.selected[1]
         self.current_slide.texts[index] = _set_text_block_text(self.current_slide.texts[index], self.text_editor.get("1.0", tk.END))
+        self._render_slide()
+
+    def _merge_selected_text_blocks(self) -> None:
+        selected_indices = sorted(index for kind, index in self.selected_items if kind == "text")
+        if len(selected_indices) < 2:
+            return
+        slide = self.current_slide
+        selected_blocks = [slide.texts[index] for index in selected_indices]
+        merged = _merge_text_blocks(selected_blocks, slide.image.width, slide.image.height)
+        first_index = selected_indices[0]
+        slide.texts = [block for index, block in enumerate(slide.texts) if index not in set(selected_indices)]
+        slide.texts.insert(min(first_index, len(slide.texts)), merged)
+        slide.texts = _sort_text_blocks_reading_order(slide.texts, slide.image.width)
+        merged_index = slide.texts.index(merged)
+        self.selected_items = {("text", merged_index)}
+        self.selected = ("text", merged_index)
         self._render_slide()
 
     def _replace_visual(self) -> None:
@@ -2173,13 +2313,12 @@ class Image2PptApp(tk.Tk):
         self.confidence = tk.DoubleVar(value=MIN_TEXT_CONFIDENCE)
         self.confidence_label = tk.StringVar()
         self.include_visuals = tk.BooleanVar(value=True)
-        self.export_mode = tk.StringVar(value="hybrid")
         self.status_text = tk.StringVar(value="Bereit")
         self._preview_image: ImageTk.PhotoImage | None = None
         self._preview_source: Image.Image | None = None
         self._is_running = False
         self._pending_output_path: Path | None = None
-        self._pending_mode: str = "hybrid"
+        self._pending_mode: str = DEFAULT_EXPORT_MODE
         self._pending_config: ReconstructionConfig = DEFAULT_CONFIG
 
         self._build_ui()
@@ -2235,15 +2374,6 @@ class Image2PptApp(tk.Tk):
         ttk.Label(options, textvariable=self.confidence_label, width=4).pack(side=tk.LEFT)
         self.visuals_check = ttk.Checkbutton(options, text="Bildobjekte erkennen", variable=self.include_visuals)
         self.visuals_check.pack(side=tk.LEFT, padx=16)
-        ttk.Label(options, text="Modus").pack(side=tk.LEFT, padx=(0, 6))
-        self.mode_select = ttk.Combobox(
-            options,
-            textvariable=self.export_mode,
-            values=EXPORT_MODES,
-            width=18,
-            state="readonly",
-        )
-        self.mode_select.pack(side=tk.LEFT)
         self.convert_button = ttk.Button(options, text="PPTX erzeugen", command=self._start_conversion)
         self.convert_button.pack(side=tk.RIGHT)
         self.open_output_button = ttk.Button(
@@ -2367,7 +2497,7 @@ class Image2PptApp(tk.Tk):
                 output_path,
                 float(self.confidence.get()),
                 bool(self.include_visuals.get()),
-                self.export_mode.get(),
+                DEFAULT_EXPORT_MODE,
             ),
             daemon=True,
         )
@@ -2425,7 +2555,6 @@ class Image2PptApp(tk.Tk):
         state = tk.DISABLED if is_running else tk.NORMAL
         self.convert_button.configure(state=state)
         self.visuals_check.configure(state=state)
-        self.mode_select.configure(state=tk.DISABLED if is_running else "readonly")
         if is_running:
             self.progress.start(12)
         else:
@@ -2454,7 +2583,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output", "-o", type=Path)
     parser.add_argument("--confidence", type=float, default=MIN_TEXT_CONFIDENCE)
     parser.add_argument("--no-visuals", action="store_true")
-    parser.add_argument("--mode", choices=EXPORT_MODES, default="hybrid")
+    parser.add_argument("--mode", choices=EXPORT_MODES, default=DEFAULT_EXPORT_MODE, help=argparse.SUPPRESS)
     parser.add_argument("--config", type=Path, help="Optionale JSON-Konfigurationsdatei.")
     parser.add_argument("--debug-dir", type=Path, help="Verzeichnis fuer Debug-Bilder, SVGs und Reports.")
     parser.add_argument("--debug", action="store_true", help="Debug-Ausgaben neben der PPTX erzeugen.")

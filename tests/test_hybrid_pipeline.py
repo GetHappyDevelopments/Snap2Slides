@@ -149,3 +149,32 @@ def test_export_uses_edited_positions_and_validates_pptx(tmp_path):
     with zipfile.ZipFile(output) as archive:
         slide_xml = archive.read("ppt/slides/slide1.xml").decode("utf-8")
     assert "Edited" in slide_xml
+
+
+def test_merge_text_blocks_keeps_reading_order_and_union_rect():
+    upper = app.TextBlock(
+        rect=app.Rect(40, 24, 90, 18),
+        lines=[app.TextLine(app.Rect(40, 24, 90, 18), "Upper", 0.95, app.TEXT_BLACK)],
+        bullet_lines=[False],
+        order=0,
+    )
+    lower_left = app.TextBlock(
+        rect=app.Rect(40, 62, 70, 18),
+        lines=[app.TextLine(app.Rect(40, 62, 70, 18), "Left", 0.95, app.TEXT_BLACK)],
+        bullet_lines=[False],
+        order=1,
+    )
+    lower_right = app.TextBlock(
+        rect=app.Rect(180, 62, 80, 18),
+        lines=[app.TextLine(app.Rect(180, 62, 80, 18), "Right", 0.95, app.TEXT_BLACK)],
+        bullet_lines=[False],
+        order=2,
+    )
+
+    merged = app._merge_text_blocks([lower_right, upper, lower_left], 320, 180)
+
+    assert merged.text == "Upper\nLeft\nRight"
+    assert merged.rect.x <= 40
+    assert merged.rect.y <= 24
+    assert merged.rect.x2 >= 260
+    assert merged.rect.y2 >= 80
